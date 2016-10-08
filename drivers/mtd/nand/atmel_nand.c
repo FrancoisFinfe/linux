@@ -39,6 +39,7 @@
 #include <linux/of_mtd.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/nand.h>
+#include <linux/mtd/nand_bch.h>
 #include <linux/mtd/partitions.h>
 
 #include <linux/delay.h>
@@ -47,6 +48,8 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/platform_data/atmel.h>
+#include <linux/errno.h>
+#include <mtd/mtd-abi.h>
 
 static int use_dma = 1;
 module_param(use_dma, int, 0);
@@ -1486,6 +1489,127 @@ static void atmel_nand_hwctl(struct mtd_info *mtd, int mode)
 
 static const struct of_device_id atmel_nand_dt_ids[];
 
+static int atmel_init_ecclayout_dt(struct nand_chip *chip,
+			      struct device_node *np)
+{
+	struct device_node *ecclayout_node;
+	struct nand_ecclayout *ecclayout = NULL;
+	struct atmel_nand_host *host = chip->priv;
+	struct nand_ecc_ctrl *ecc = &chip->ecc;
+	struct mtd_info *mtd = &host->mtd;
+	int res = 0, eccsize, strength, oobfree_size, pagesize, i;
+
+	if ((FIELD_SIZEOF(struct nand_oobfree, offset) != FIELD_SIZEOF(struct nand_oobfree, length)) ||
+			FIELD_SIZEOF(struct nand_oobfree, offset) != 4 || offsetof(struct nand_oobfree, offset) != 0) {
+		/* unlikely except if struct nand_oobfree is modified.
+		 * TODO: convert to a preprocessor check */
+		dev_err(host->dev, "BUG, oobfree member offset type must be u32, followed by length (u32)");
+		return 0;
+	}
+
+	eccsize = of_get_nand_ecc_step_size(np);
+	strength = of_get_nand_ecc_strength(np);
+
+	if (eccsize > 0 && strength > 0) {
+		ecc->size = eccsize;
+		ecc->strength = strength;
+	}
+
+	ecclayout_node = of_get_child_by_name(np, "nand-ecc-layout");
+
+	if (ecclayout_node == NULL) {
+		/* ecc-layout node not found */
+		return 0;
+	}
+
+	ecclayout = devm_kzalloc(host->dev, sizeof(struct nand_ecclayout), GFP_KERNEL);
+
+	if (ecclayout == NULL) {
+		res = -ENOMEM;
+		goto atmel_init_ecclayout_dt_err;
+	}
+
+	res = of_property_read_u32(ecclayout_node, "page-size", &pagesize);
+	if (res) {
+		dev_err(host->dev, "ecc page-size not provided\n");
+		goto atmel_init_ecclayout_dt_err;
+	}
+
+	res = of_property_read_u32(ecclayout_node, "byte", &ecclayout->eccbytes);
+	if (res) {
+		dev_err(host->dev, "eccbyte not provided\n");
+		goto atmel_init_ecclayout_dt_err;
+	}
+
+	if (!ecclayout->eccbytes || ecclayout->eccbytes > MTD_MAX_ECCPOS_ENTRIES_LARGE) {
+		dev_err(host->dev, "invalid eccbyte %u\n", ecclayout->eccbytes);
+		res = -EINVAL;
+		goto atmel_init_ecclayout_dt_err;
+	}
+
+	res = of_property_read_u32_array(ecclayout_node, "eccpos", ecclayout->eccpos,
+		(size_t) ecclayout->eccbytes);
+	if (res) {
+		dev_err(host->dev, "eccpos not provided or invalid size\n");
+		goto atmel_init_ecclayout_dt_err;
+	}
+
+	oobfree_size = of_property_count_elems_of_size(ecclayout_node, "oobfree", sizeof(u32));
+	if (oobfree_size <= 0) {
+		dev_warn(host->dev, "oobfree not provided");
+		oobfree_size = 0;
+	} else {
+		if (oobfree_size%2) {
+			dev_err(host->dev,"invalid oobfree array");
+			res = -EINVAL;
+			goto atmel_init_ecclayout_dt_err;
+		} else if (oobfree_size%2 > MTD_MAX_OOBFREE_ENTRIES_LARGE) {
+			dev_err(host->dev, "oobfree too big (%d, max: %u)", oobfree_size%2, MTD_MAX_OOBFREE_ENTRIES_LARGE);
+			res = -EOVERFLOW;
+			goto atmel_init_ecclayout_dt_err;
+		}
+	}
+
+	/* read oobfree */
+	if (oobfree_size)
+		of_property_read_u32_array(ecclayout_node, "oobfree", (u32 *) ecclayout->oobfree, oobfree_size);
+
+	for (i=0; i < oobfree_size/2; i++) {
+		dev_info(host->dev, "oob[%d]: offset = %d, len = %d\n",
+				i, ecclayout->oobfree[i].offset, ecclayout->oobfree[i].length);
+		ecclayout->oobavail += ecclayout->oobfree[i].length;
+	}
+
+	dev_dbg(host->dev, "DT ecc parameter byte: %u, pagesize: %d, size: %d, oobavail: %d\n",
+			ecclayout->eccbytes, pagesize, ecc->size, ecclayout->oobavail);
+
+	/* if board ecc layout not compatible with nand, ignore it */
+	if (pagesize != mtd->writesize) {
+		dev_warn(host->dev, "atmel_nand: page of dt ecc layout (%d) not "
+				"compatible with nand (%d), default ecc layout will be used\n",
+				pagesize,
+				mtd->writesize);
+		res = -EINVAL;
+	} else if (!ecc->size) {
+		dev_warn(host->dev, "atmel_nand: board ecc size not defined, "
+				"default ecc layout will be used\n");
+		return -ENODATA;
+	} else {
+		ecc->layout = ecclayout;
+		/* ecc.bytes = "total ecc bytes(per page)" / "number of ecc block in a page"
+		 * for each ecc block (size = ecc.size), ecc is computed, with ecc.size byte
+		 */
+		ecc->bytes = ecclayout->eccbytes * ecc->size /  mtd->writesize;
+	}
+
+atmel_init_ecclayout_dt_err:
+	if (ecclayout && res < 0)
+		kfree(ecclayout);
+
+	of_node_put(ecclayout_node);
+	return res;
+}
+
 static int atmel_of_init_port(struct atmel_nand_host *host,
 			      struct device_node *np)
 {
@@ -2230,6 +2354,10 @@ static int atmel_nand_probe(struct platform_device *pdev)
 		res = -ENXIO;
 		goto err_scan_ident;
 	}
+
+	/* check for a custom ecc layout in device tree */
+	if (IS_ENABLED(CONFIG_OF) && pdev->dev.of_node)
+		atmel_init_ecclayout_dt(nand_chip, pdev->dev.of_node);
 
 	if (nand_chip->ecc.mode == NAND_ECC_HW) {
 		if (host->has_pmecc)

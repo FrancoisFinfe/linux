@@ -42,6 +42,25 @@ Optional properties:
   - Optional properties:
     - atmel,write-by-sram: boolean to enable NFC write by sram.
 
+Optional sub-node:
+- nand-ecc-layout can be used to specificy a custom ecc layout
+  - Required properties:
+    - compatible: "atmel"
+    - byte: number (uint) of ECC bytes used to protect a page
+    - page-size: expected number (uint) of bytes in main-area per page. During
+                 the driver initialisation (probe), nand pagesize is read.
+                 This properties is compared with nand pagesize. If values
+                 don't match, the custom ecclayout is discarded.
+    - eccpos : array of uint, offset (pos) of ecc bytes in oob-area.
+               The number of element in the array must be equal to the
+               "byte" property.
+    - oobfree : array of uint, position of free oob byte (not used for bad
+                block indication, nor ecc, ...). Format of the array is
+                offset0, length0, offset1, length1, offset2, length2,...
+                E.g.: if offset (position) of oobfree are 2 3 4 6 7, the
+                oobfree area would be <2 3 6 2>
+
+
 Examples:
 nand0: nand@40000000,0 {
 	compatible = "atmel,at91rm9200-nand";
@@ -109,3 +128,43 @@ nand0: nand@40000000 {
 		>;
 	};
 };
+
+/* for ECC bch8 on a nand with pagesize of 2 KiB and oob size of 64 B
+ * Warning: eccpos must be chosen carefully.
+ * Some oob byte might be reserved (e.g.: nand factory bad block mark,..)
+ * Check the manucturer datasheet
+ */
+
+nand0: nand@40000000 {
+	nand-bus-width = <8>;
+	nand-ecc-mode = "soft_bch";
+	atmel,nand-addr-offset = <21>;
+	atmel,nand-cmd-offset = <22>;
+	nand-on-flash-bbt;
+	gpios =<&pioC 6 0 /* rdy */
+			&pioC 14 0 /* nce */
+			0 /* cd */
+			>;
+	nand-ecc-strength = <8>;
+	nand-ecc-step-size = <512>;		/* ecc block size, number of data bytes that are covered by a single ECC step.*/
+	status = "okay";
+
+	nand-ecc-layout {
+		/* mtd will skip this node if this compatible is present or reg missing */
+		compatible = "atmel";
+		byte = <52>;					/* number of oob byte p. page reserved for ecc */
+		page-size = <2048>;				/* expected nand page size */
+		eccpos = <  8  9 10 11
+			 12 13 14 15 18 19 20 21
+			 22 23 24 25 26 27 28 29
+			 30 31 34 35 36 37 38 39
+			 40 41 42 43 44 45 46 47
+			 48 49 50 51 52 53 54 55
+			 56 57 58 59 60 61 62 63 >;
+		oobfree = < 2 3 /* offset, length */
+			6 2
+			>;
+	};
+	partition@0 {
+		...
+	};
